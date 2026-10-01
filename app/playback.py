@@ -13,6 +13,11 @@
   冲突或无解即失败且会话保持不变；成功则整体替换会话快照与源版本，
   场景本身不受影响。
 
+场景的“读取快照—冻结字幕检查—重算分轨—替换会话”在同一会话锁内作为
+完整操作完成，与同会话的推进、接纳串行生效：排队到本请求时才读取场景，
+因此迟到的接纳拿到的是轮到它生效时的最新快照，不会把早先读到的旧快照
+回写、覆盖已经生效的接纳。
+
 会话只存在于本进程内存中，不随重启保留。同一会话上的推进与接纳通过
 会话级互斥锁串行化：每次调用要么完整生效，要么完全无效。
 """
@@ -21,7 +26,7 @@ from __future__ import annotations
 import threading
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .solver import Subtitle, solve
 from .storage import SceneRecord
@@ -32,6 +37,14 @@ class AcceptConflict(Exception):
 
     原因包括：轨道数变化、已开始字幕被修改/删除、新增或修改的字幕
     未在游标之后开始、固定已开始字幕的原分轨后重算无解。
+    """
+
+
+class SceneMissing(Exception):
+    """轮到接纳生效时，场景已不存在（对应 HTTP 404）。
+
+    由 accept_current 在会话锁内读取场景时抛出，保证“不存在”这一
+    判断与接纳替换属于同一次完整操作，不会被并发的会话操作穿插。
     """
 
 
@@ -140,63 +153,95 @@ class PlaybackManager:
             }
 
     def accept(self, session: PlaybackSession, record: SceneRecord) -> Dict[str, Any]:
-        """接纳场景当前快照：校验已开始字幕、固定原分轨并重算全部分轨。"""
+        """接纳调用方给定的场景快照（在会话锁内校验、重算并替换）。
+
+        调用方须在同一把会话锁的保护下取得 record；否则“读到的快照”
+        可能在本方法取锁前过期。HTTP 路径请改用 accept_current，由本
+        管理器在会话锁内完成读取，以避免旧快照回写覆盖已生效的接纳。
+        """
         with session.lock:
-            if record.track_count != session.track_count:
+            return self._apply_accept(session, record)
+
+    def accept_current(
+        self,
+        session: PlaybackSession,
+        fetch: Callable[[], Optional[SceneRecord]],
+    ) -> Dict[str, Any]:
+        """接纳场景当前快照：在会话锁内读取、校验、重算并整体替换。
+
+        场景读取（fetch）与冻结字幕检查、分轨重算、会话替换处于同一把
+        会话锁内，因此同一会话上的推进与多个接纳严格串行：每个请求接纳
+        的都是轮到它生效那一刻的场景快照，早先读到的旧快照无法在恢复后
+        覆盖已经接纳了新快照的会话。fetch 返回 None 时抛出 SceneMissing
+        （HTTP 层映射为 404）；冲突或无解抛出 AcceptConflict（409），
+        两者都不改变会话，也不改变场景。
+        """
+        with session.lock:
+            record = fetch()
+            if record is None:
+                raise SceneMissing(session.scene_id)
+            return self._apply_accept(session, record)
+
+    @staticmethod
+    def _apply_accept(
+        session: PlaybackSession, record: SceneRecord
+    ) -> Dict[str, Any]:
+        """会话锁内的接纳主体：校验已开始字幕、固定原分轨并重算全部分轨。"""
+        if record.track_count != session.track_count:
+            raise AcceptConflict(
+                f"轨道数不得变化：会话为 {session.track_count}，"
+                f"场景当前为 {record.track_count}"
+            )
+
+        # 游标前已开始（start_ms <= 游标）的字幕必须原样保留
+        started = {
+            s["id"]: s
+            for s in session.subtitles
+            if s["start_ms"] <= session.cursor_ms
+        }
+        new_by_id = {s["id"]: s for s in record.subtitles}
+        for sid, old in started.items():
+            new = new_by_id.get(sid)
+            if new is None:
+                raise AcceptConflict(f"字幕 {sid!r} 已开始，不得删除")
+            if _identity(new) != _identity(old):
                 raise AcceptConflict(
-                    f"轨道数不得变化：会话为 {session.track_count}，"
-                    f"场景当前为 {record.track_count}"
+                    f"字幕 {sid!r} 已开始，其 id/speaker/起止时间/"
+                    "locked_track 不得修改"
+                )
+        # 其余字幕可改删或加入，但都必须在游标之后开始
+        for new in record.subtitles:
+            if new["start_ms"] <= session.cursor_ms and new["id"] not in started:
+                raise AcceptConflict(
+                    f"字幕 {new['id']!r} 的开始时间不晚于游标 "
+                    f"{session.cursor_ms}：新增/修改的字幕必须在游标之后开始"
                 )
 
-            # 游标前已开始（start_ms <= 游标）的字幕必须原样保留
-            started = {
-                s["id"]: s
-                for s in session.subtitles
-                if s["start_ms"] <= session.cursor_ms
-            }
-            new_by_id = {s["id"]: s for s in record.subtitles}
-            for sid, old in started.items():
-                new = new_by_id.get(sid)
-                if new is None:
-                    raise AcceptConflict(f"字幕 {sid!r} 已开始，不得删除")
-                if _identity(new) != _identity(old):
-                    raise AcceptConflict(
-                        f"字幕 {sid!r} 已开始，其 id/speaker/起止时间/"
-                        "locked_track 不得修改"
-                    )
-            # 其余字幕可改删或加入，但都必须在游标之后开始
-            for new in record.subtitles:
-                if new["start_ms"] <= session.cursor_ms and new["id"] not in started:
-                    raise AcceptConflict(
-                        f"字幕 {new['id']!r} 的开始时间不晚于游标 "
-                        f"{session.cursor_ms}：新增/修改的字幕必须在游标之后开始"
-                    )
+        # 固定已开始字幕的原分轨，按新快照顺序与最少换轨、并列规则重算
+        session_track = {
+            s["id"]: t for s, t in zip(session.subtitles, session.tracks)
+        }
+        subs = [
+            Subtitle(
+                id=s["id"],
+                speaker=s["speaker"],
+                start_ms=s["start_ms"],
+                end_ms=s["end_ms"],
+                locked_track=(
+                    session_track[s["id"]]
+                    if s["id"] in started
+                    else s.get("locked_track")
+                ),
+            )
+            for s in record.subtitles
+        ]
+        tracks, changes = solve(subs, session.track_count)
+        if tracks is None:
+            raise AcceptConflict("固定已开始字幕的原分轨后，新快照无解")
 
-            # 固定已开始字幕的原分轨，按新快照顺序与最少换轨、并列规则重算
-            session_track = {
-                s["id"]: t for s, t in zip(session.subtitles, session.tracks)
-            }
-            subs = [
-                Subtitle(
-                    id=s["id"],
-                    speaker=s["speaker"],
-                    start_ms=s["start_ms"],
-                    end_ms=s["end_ms"],
-                    locked_track=(
-                        session_track[s["id"]]
-                        if s["id"] in started
-                        else s.get("locked_track")
-                    ),
-                )
-                for s in record.subtitles
-            ]
-            tracks, changes = solve(subs, session.track_count)
-            if tracks is None:
-                raise AcceptConflict("固定已开始字幕的原分轨后，新快照无解")
-
-            # 成功：整体替换会话快照与源版本（场景本身不变）
-            session.subtitles = [dict(s) for s in record.subtitles]
-            session.tracks = list(tracks)
-            session.changes = changes
-            session.source_revision = record.revision
-            return session.state()
+        # 成功：整体替换会话快照与源版本（场景本身不变）
+        session.subtitles = [dict(s) for s in record.subtitles]
+        session.tracks = list(tracks)
+        session.changes = changes
+        session.source_revision = record.revision
+        return session.state()

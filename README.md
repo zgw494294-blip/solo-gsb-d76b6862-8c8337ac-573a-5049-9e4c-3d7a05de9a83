@@ -283,6 +283,8 @@ HTTP/1.1 409 Conflict
 
 `/assign` 与 `/scenes` 都是无状态的计算/存储；播放会话则让“正在播放”的场景跟上后续修订：先按 `scene_id` 创建会话（复制场景当时的完整快照，游标从 0 毫秒开始），播放过程中推进游标，场景被修订后让会话接纳最新快照。会话是**单进程内存态**，不写入 SQLite、不跨重启保留；同一会话上的推进与接纳按完整操作串行生效（并发请求不会交错出中间态）。
 
+> **接纳的原子性（旧快照回写缺陷的修复）**：`accept` 把**读取场景快照 → 已开始字幕冻结检查 → 分轨重算 → 整体替换会话**放在同一把会话锁内，与同会话的推进、其他接纳严格串行。请求在轮到自己生效时才读取场景，因此排队期间场景已被接纳到新版本时，迟到的请求接纳的是**轮到它生效那一刻的最新快照**——不会拿早先读到的旧快照把 `source_revision` 与字幕回退、覆盖已经生效的接纳，也不会只跳过旧数据而仍报告成功。若它生效时的最新快照与已开始字幕冲突或无解，仍返回 **409**，且会话、场景都不变。该修复不改变任何请求、响应与错误码，也不引入会话持久化或多进程支持。
+
 - `POST /sessions`：创建会话。请求体 `{"scene_id": "..."}`；场景不存在返回 404。响应为会话完整状态：`session_id`、`scene_id`、`source_revision`（快照来源的场景版本）、`cursor_ms`（初始 0）、`track_count`、`subtitles`、`assignments`、`changes`。
 - `POST /sessions/{session_id}/advance`：推进游标。请求体 `{"time_ms": N}`，`N` 为非负整数且**只能不减**（等于当前游标允许）；负数、非整数或倒退返回 422 且会话不变。响应含 `source_revision`、`cursor_ms` 与 `active`：游标时刻处于 `[start_ms, end_ms)`（左闭右开）区间的字幕及其轨道。
 - `POST /sessions/{session_id}/accept`：接纳场景当前快照。规则：
@@ -394,6 +396,55 @@ HTTP/1.1 409 Conflict
 
 固定已开始字幕的原分轨后新快照无解时同样返回 409。失败的接纳不改变会话：游标、快照、`source_revision` 保持原值，可继续推进或在场景改回合法内容后重试接纳。
 
+### 示例 13：并发接纳不再被旧快照回写（修复验证）
+
+复现缺陷场景：会话基于场景版本 1、游标暂停在 900；版本 1 中未开始字幕 `s3` 为 `[1000,2000)`。随后把 `s3` 的 `end_ms` 由 `2000` 改为 `4000` 保存为版本 2。若两个接纳请求交错——R1 先读到版本 1 后暂停，R2 先接纳版本 2，R1 再恢复——修复前 R1 会把会话的 `source_revision` 与字幕**退回版本 1** 却仍返回成功；修复后 R1 在轮到自己生效时重新读取，接纳的是当时仍在生效的版本 2。
+
+下面这段可直接执行的脚本用后台进程制造上述交错，并校验两次接纳最终都停留在版本 2（需要服务已在 8080 运行）：
+
+```bash
+set -e
+BASE=http://localhost:8080
+SCENE=scene-race
+
+# 1) 版本 1：游标 900 时 s1、s2 已开始，s3[1000,2000) 未开始
+curl -s -X PUT $BASE/scenes/$SCENE -H 'Content-Type: application/json' -d '{
+  "track_count": 2, "expected_revision": 0,
+  "subtitles": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+    {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+    {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2000}
+  ]
+}' >/dev/null
+
+SID=$(curl -s -X POST $BASE/sessions -H 'Content-Type: application/json' \
+  -d "{\"scene_id\": \"$SCENE\"}" | sed -n 's/.*"session_id": *"\([^"]*\)".*/\1/p')
+curl -s -X POST $BASE/sessions/$SID/advance -H 'Content-Type: application/json' \
+  -d '{"time_ms": 900}' >/dev/null
+
+# 2) 保存版本 2：未开始字幕 s3 的 end_ms 2000 -> 4000
+curl -s -X PUT $BASE/scenes/$SCENE -H 'Content-Type: application/json' -d '{
+  "track_count": 2, "expected_revision": 1,
+  "subtitles": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+    {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+    {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 4000}
+  ]
+}' >/dev/null
+
+# 3) 两个并发接纳：无论谁先取到会话锁，二者都接纳版本 2
+curl -s -X POST $BASE/sessions/$SID/accept > /tmp/accept_a.json &
+curl -s -X POST $BASE/sessions/$SID/accept > /tmp/accept_b.json &
+wait
+
+grep -o '"source_revision": *[0-9]*' /tmp/accept_a.json
+grep -o '"source_revision": *[0-9]*' /tmp/accept_b.json
+```
+
+两次输出都应为 `"source_revision": 2`，且 `subtitles` 中 `s3` 的 `end_ms` 都是 `4000`：迟到的请求接纳的是轮到它生效时的快照，不会退回 1。若版本 2 改的是已开始字幕（如给已开始的 `s1` 加 `locked_track`），交错中的接纳会在生效时按版本 2 判定并返回 **409**，会话仍停留在接纳前状态。
+
+> 纯 HTTP 脚本无法在“进程读到旧快照、尚未取到会话锁”的瞬间精确暂停；这种**可控交错**由回归测试 `tests/test_playback.py` 中的 `test_late_accept_adopts_snapshot_in_effect_at_its_turn`、`test_late_accept_conflicting_snapshot_returns_409_not_stale_success` 与 `test_accept_and_advance_serialized_through_session_lock` 覆盖（在会话锁上注入确定性暂停点）。这几个用例在修复前的代码上分别以“R1 把版本回退到 1”与“R1 拿旧快照返回 200（应为 409）”而失败，修复后全部通过。上面的并发脚本则展示真实运行时两个并发接纳的最终一致结果。
+
 健康检查：
 
 ```bash
@@ -438,7 +489,7 @@ app/
   main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验）
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制）
-  playback.py  # 播放会话：单进程内存态，推进/接纳与保轨重算
+  playback.py  # 播放会话：单进程内存态，推进/接纳；接纳在会话锁内读快照—校验—重算—替换
 tests/
   conftest.py        # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py     # 求解器单元测试

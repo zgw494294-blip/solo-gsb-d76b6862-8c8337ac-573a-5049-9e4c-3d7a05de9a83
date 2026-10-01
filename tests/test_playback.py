@@ -1,13 +1,14 @@
 """播放会话测试：创建/推进/接纳、已开始字幕保轨、冲突 409、并发串行化。"""
 import json
 import threading
+import time
 
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app.main import app  # noqa: E402
+from app.main import app, get_playback  # noqa: E402
 
 
 def scene_payload(track_count=2):
@@ -471,3 +472,256 @@ def test_concurrent_advances_serialized():
     assert client.post(
         f"/sessions/{sid}/advance", json={"time_ms": 899}
     ).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 旧快照回写缺陷的回归：可控交错（controllable interleaving）
+#
+# 缺陷表现：accept 在会话锁之外读取场景。R1 读到 revision 1 后暂停，
+# 场景保存为 revision 2 且 R2 先完成接纳；R1 恢复后拿旧快照覆盖会话，
+# source_revision 与字幕被退回 1，却仍报告成功。
+#
+# 修复后：场景读取、冻结字幕检查、分轨、会话替换在会话锁内作为完整操作，
+# 与同会话的推进、接纳串行；排队中的请求轮到自己时才读场景。
+#
+# 下面的 _GatedLock 包住会话自身的锁，以确定性方式复现交错：
+# - when="before"：第一个进入 accept 的请求在“获取会话锁之前”被拦住，
+#   正好对应旧代码锁外读完场景、尚未进入会话锁的暂停点；修复后该请求
+#   尚未读取场景，放行后在锁内读到的就是轮到它时的最新快照。
+# - when="after"：第一个请求拿到会话锁之后（旧代码此时还没做任何修改）
+#   被拦住，用于验证接纳/推进在锁内互斥、推进看到的是接纳后的状态。
+# ---------------------------------------------------------------------------
+
+
+class _GatedLock:
+    """包一层会话锁，在第一次 acquire 时按 when 注入一个可控暂停点。"""
+
+    def __init__(self, inner, when):
+        self._inner = inner
+        self._when = when
+        self._count_lock = threading.Lock()
+        self._calls = 0
+        self.first_entered = threading.Event()
+        self.release_gate = threading.Event()
+
+    def acquire(self, blocking=True, timeout=-1):
+        with self._count_lock:
+            self._calls += 1
+            first = self._calls == 1
+        if first and self._when == "before":
+            self.first_entered.set()
+            assert self.release_gate.wait(10)
+        acquired = self._inner.acquire(blocking, timeout)
+        if acquired and first and self._when == "after":
+            self.first_entered.set()
+            assert self.release_gate.wait(10)
+        return acquired
+
+    def release(self):
+        self._inner.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+
+
+def _install_gate(sid, when):
+    """给指定会话的锁装上暂停闸并返回（accept 路径每次请求各取一次锁）。"""
+    session = get_playback().get(sid)
+    inner = session.lock
+    gate = _GatedLock(inner, when)
+    session.lock = gate
+    return gate
+
+
+def _start_post(path, name, results, payload=None):
+    def worker():
+        local = TestClient(app)
+        resp = local.post(path, json=payload)
+        try:
+            results[name] = (resp.status_code, resp.json())
+        except Exception:
+            results[name] = (resp.status_code, resp.content)
+
+    thread = threading.Thread(target=worker, name=name)
+    thread.start()
+    return thread
+
+
+def _stale_writeback_scene_v1():
+    """s1[0,1000) s2[800,3000)锁2 s3[1000,2000) —— 分轨 1/2/1，换轨 0。
+
+    游标 900 时 s1、s2 已开始，s3（start 1000）未开始；版本 2 把未开始
+    的 s3 的 end_ms 从 2000 改为 4000，正对应缺陷描述的交错。
+    """
+    return [
+        {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000},
+        {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000,
+         "locked_track": 2},
+        {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2000},
+    ]
+
+
+def _make_stale_writeback_session(client, scene_id="scene-stale"):
+    """以 s3 end_ms=2000 的版本 1 建场景并创建会话，游标推进到 900。"""
+    assert client.put(f"/scenes/{scene_id}", json={
+        "track_count": 2,
+        "expected_revision": 0,
+        "subtitles": _stale_writeback_scene_v1(),
+    }).status_code == 200
+    sid = client.post("/sessions", json={"scene_id": scene_id}).json()[
+        "session_id"
+    ]
+    assert client.post(
+        f"/sessions/{sid}/advance", json={"time_ms": 900}
+    ).status_code == 200
+    return scene_id, sid
+
+
+def test_late_accept_adopts_snapshot_in_effect_at_its_turn():
+    """R1 读到版本 1 后暂停；版本 2 保存、R2 先接纳；R1 不得回退到版本 1。"""
+    client = TestClient(app)
+    scene_id, sid = _make_stale_writeback_session(client)
+    gate = _install_gate(sid, "before")
+    results = {}
+
+    # R1：进入 accept（修复前已在锁外读完版本 1），在取会话锁前暂停
+    r1 = _start_post(f"/sessions/{sid}/accept", "R1", results)
+    assert gate.first_entered.wait(5)
+
+    # R1 暂停期间：未开始字幕 s3 的 end_ms 2000 -> 4000，保存为版本 2
+    v2 = _stale_writeback_scene_v1()
+    v2[2]["end_ms"] = 4000
+    revise(client, scene_id, 1, v2)
+
+    # R2 先接纳版本 2（修复前：不经过 R1 的暂停点，立即完成）
+    r2 = _start_post(f"/sessions/{sid}/accept", "R2", results)
+    r2.join(10)
+    assert "R2" in results
+    assert results["R2"][0] == 200
+    assert results["R2"][1]["source_revision"] == 2
+    assert results["R2"][1]["subtitles"] == [
+        {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000,
+         "locked_track": None},
+        {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000,
+         "locked_track": 2},
+        {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 4000,
+         "locked_track": None},
+    ]
+
+    # R1 恢复：修复前会把 source_revision 与字幕退回 1 却仍报成功；
+    # 修复后它在锁内重新读取，接纳轮到它时仍在生效的版本 2。
+    gate.release_gate.set()
+    r1.join(10)
+    assert "R1" in results
+    assert results["R1"][0] == 200
+    assert results["R1"][1]["source_revision"] == 2
+    assert [s["end_ms"] for s in results["R1"][1]["subtitles"]
+            if s["id"] == "s3"] == [4000]
+
+    # 会话最终状态停留在版本 2：游标保留、已开始字幕字段与原轨道保留，
+    # 新快照顺序与最少换轨/并列规则下 s3 仍为轨道 1
+    state = get_playback().get(sid).state()
+    assert state["source_revision"] == 2
+    assert state["cursor_ms"] == 900
+    assert [s["end_ms"] for s in state["subtitles"] if s["id"] == "s3"] == [4000]
+    assert state["assignments"] == [
+        {"id": "s1", "track": 1},
+        {"id": "s2", "track": 2},
+        {"id": "s3", "track": 1},
+    ]
+
+    # 后续再接纳仍是版本 2；场景本身不被接纳改动
+    resp = client.post(f"/sessions/{sid}/accept")
+    assert resp.status_code == 200
+    assert resp.json()["source_revision"] == 2
+    scene = client.get(f"/scenes/{scene_id}").json()
+    assert scene["revision"] == 2
+
+
+def test_late_accept_conflicting_snapshot_returns_409_not_stale_success():
+    """R1 暂停期间版本 2 动了已开始字幕：轮到 R1 时必须按版本 2 判冲突 409。
+
+    修复前 R1 拿着版本 1 的旧快照，会无视已生效的版本 2 而返回 200；
+    修复后它在锁内读到版本 2，按已开始字幕规则判冲突，会话保持版本 1。
+    """
+    client = TestClient(app)
+    scene_id, sid = _make_stale_writeback_session(client)
+    gate = _install_gate(sid, "before")
+    results = {}
+
+    r1 = _start_post(f"/sessions/{sid}/accept", "R1", results)
+    assert gate.first_entered.wait(5)
+
+    # 版本 2：改动游标 900 时已开始的 s1（start 0 <= 900）的 locked_track。
+    # 该快照本身合法且可保存（s1 锁 1、s2 锁 2、s3 与 s2 重叠故取 1），
+    # 但已开始字幕的任何身份字段变化都会让接纳判冲突。
+    v2 = _stale_writeback_scene_v1()
+    v2[0]["locked_track"] = 1
+    revise(client, scene_id, 1, v2)
+
+    # 场景仍可正常保存（合法快照），但任何接纳都会得到 409
+    assert client.get(f"/scenes/{scene_id}").json()["revision"] == 2
+
+    gate.release_gate.set()
+    r1.join(10)
+    assert "R1" in results
+    assert results["R1"][0] == 409
+    assert "s1" in results["R1"][1]["detail"]["message"]
+
+    # 失败不得改会话：source_revision、字幕、游标全部停留在接纳前
+    state = get_playback().get(sid).state()
+    assert state["source_revision"] == 1
+    assert state["cursor_ms"] == 900
+    assert [s["end_ms"] for s in state["subtitles"] if s["id"] == "s1"] == [1000]
+    assert state["assignments"] == [
+        {"id": "s1", "track": 1},
+        {"id": "s2", "track": 2},
+        {"id": "s3", "track": 1},
+    ]
+
+    # 场景本身也未被失败的接纳改动
+    assert client.get(f"/scenes/{scene_id}").json()["revision"] == 2
+
+
+def test_accept_and_advance_serialized_through_session_lock():
+    """接纳持锁期间，同会话推进必须排队，恢复后看到接纳后的新快照。"""
+    client = TestClient(app)
+    scene_id, sid = _make_stale_writeback_session(client)
+
+    # 版本 2：未开始的 s3 延长到 4000，可被接纳
+    v2 = _stale_writeback_scene_v1()
+    v2[2]["end_ms"] = 4000
+    revise(client, scene_id, 1, v2)
+
+    gate = _install_gate(sid, "after")
+    results = {}
+
+    # accept 拿到会话锁、已在锁内读到版本 2，随后被闸停在临界区里
+    r_accept = _start_post(f"/sessions/{sid}/accept", "accept", results)
+    assert gate.first_entered.wait(5)
+
+    # 推进在 accept 持锁期间到达：只能排队，不能插入临界区
+    r_advance = _start_post(
+        f"/sessions/{sid}/advance", "advance", results, payload={"time_ms": 3500}
+    )
+    time.sleep(0.2)
+    assert "advance" not in results
+
+    # 放行接纳：推进随后生效，且看到的是接纳后的版本 2
+    gate.release_gate.set()
+    r_accept.join(10)
+    r_advance.join(10)
+    assert results["accept"][0] == 200
+    assert results["accept"][1]["source_revision"] == 2
+    assert results["advance"][0] == 200
+    advance_body = results["advance"][1]
+    assert advance_body["source_revision"] == 2
+    assert advance_body["cursor_ms"] == 3500
+    # 3500 时：s1（end 2000）已结束；s3 延长到 4000 后仍在屏
+    assert [(a["id"], a["track"]) for a in advance_body["active"]] == [
+        ("s3", 1),
+    ]

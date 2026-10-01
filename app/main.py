@@ -13,6 +13,7 @@ from .playback import (
     CursorRegression,
     PlaybackManager,
     PlaybackSession,
+    SceneMissing,
 )
 from .solver import Subtitle, solve, validate
 from .storage import RevisionConflict, SceneRecord, SceneStore
@@ -24,9 +25,10 @@ app = FastAPI(
         "同一说话人按时间相邻字幕的换轨次数最少，并列取轨道号序列字典序最小者。"
         "场景（scene）可按 scene_id 保存修订快照，并以版本号做乐观并发控制。"
         "播放会话（session）按 scene_id 创建内存态会话，游标推进中可接纳场景"
-        "后续修订：已开始字幕保持原分轨，其余按原规则重算。"
+        "后续修订：已开始字幕保持原分轨，其余按原规则重算。场景读取与接纳"
+        "替换在会话锁内作为完整操作串行生效，迟到请求接纳轮到它时的最新快照。"
     ),
-    version="1.2.0",
+    version="1.2.1",
 )
 
 
@@ -401,26 +403,39 @@ def advance_session(session_id: str, req: AdvanceRequest) -> AdvanceResponse:
 def accept_scene_revision(session_id: str) -> SessionStateResponse:
     """接纳场景当前快照，让播放中的会话跟上后续修订。
 
+    场景读取、冻结字幕检查、分轨重算与会话替换在同一会话锁内作为一个
+    完整操作完成，并与同会话的推进、其他接纳严格串行：请求在轮到自己
+    生效时才读取场景，因此迟到（排队期间场景已被接纳到新版本）的请求
+    接纳的是当时的最新快照，不会拿早先读到的旧快照回写、覆盖已经生效
+    的接纳；也不会只跳过旧数据而仍报告成功。
+
     - 轨道数不得变；
     - 会话中 start_ms <= 游标的字幕，其 id、speaker、起止时间、
       locked_track 必须不变，并固定原分轨；
     - 其余字幕可改、可删、可新增，但都必须在游标之后开始；
     - 按新快照顺序与最少换轨、并列规则重算全部分轨。
 
-    冲突或无解返回 409 且会话不变；成功则整体替换会话快照与源版本
-    （场景本身不变），返回会话最新完整状态。
+    冲突或无解返回 409 且会话不变；轮到生效时场景已不存在返回 404；
+    成功则整体替换会话快照与源版本（场景本身不变），返回会话最新完整
+    状态。
     """
     session = _get_session_or_404(session_id)
-    record = get_store().get_scene(session.scene_id)
-    if record is None:
-        raise HTTPException(
-            status_code=404, detail=f"场景 {session.scene_id!r} 不存在"
-        )
+    scene_id = session.scene_id
+    store = get_store()
+
+    def fetch_current_scene():
+        # 在会话锁内执行：读快照与后续校验、替换不可被同会话操作穿插
+        return store.get_scene(scene_id)
+
     try:
-        state = get_playback().accept(session, record)
+        state = get_playback().accept_current(session, fetch_current_scene)
+    except SceneMissing:
+        raise HTTPException(
+            status_code=404, detail=f"场景 {scene_id!r} 不存在"
+        )
     except AcceptConflict as exc:
         raise HTTPException(
             status_code=409,
-            detail={"message": str(exc), "scene_id": session.scene_id},
+            detail={"message": str(exc), "scene_id": scene_id},
         )
     return SessionStateResponse(**state)
