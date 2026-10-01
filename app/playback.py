@@ -14,14 +14,17 @@
   场景本身不受影响。
 
 会话只存在于本进程内存中，不随重启保留。同一会话上的推进与接纳通过
-会话级互斥锁串行化：每次调用要么完整生效，要么完全无效。
+会话级互斥锁串行化：每次调用要么完整生效，要么完全无效。接纳是一个
+完整操作——场景快照的读取（load_record 回调）、已开始字幕校验、分轨
+重算与会话替换都在会话锁内完成，因此并发下迟到的接纳请求读到的一定
+是轮到它生效时的场景快照，不会把会话回写到进入锁之前读到的旧版本。
 """
 from __future__ import annotations
 
 import threading
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .solver import Subtitle, solve
 from .storage import SceneRecord
@@ -44,6 +47,14 @@ class CursorRegression(Exception):
         super().__init__(
             f"time_ms={time_ms} 小于当前游标 cursor_ms={cursor_ms}，游标只能不减"
         )
+
+
+class SceneUnavailable(Exception):
+    """接纳生效时场景已不存在（对应 HTTP 404）。"""
+
+    def __init__(self, scene_id: str) -> None:
+        self.scene_id = scene_id
+        super().__init__(f"场景 {scene_id!r} 不存在")
 
 
 @dataclass
@@ -139,9 +150,22 @@ class PlaybackManager:
                 "active": session.active(),
             }
 
-    def accept(self, session: PlaybackSession, record: SceneRecord) -> Dict[str, Any]:
-        """接纳场景当前快照：校验已开始字幕、固定原分轨并重算全部分轨。"""
+    def accept(
+        self,
+        session: PlaybackSession,
+        load_record: Callable[[], Optional[SceneRecord]],
+    ) -> Dict[str, Any]:
+        """接纳场景当前快照：读取场景、校验、重算分轨、替换会话为完整操作。
+
+        load_record 在会话锁内调用，因此读到的是“轮到本次接纳生效时”的
+        场景快照；与同一会话的推进/接纳串行。这样并发下迟到的请求不会
+        把进入锁之前读到的旧快照回写到会话上。场景不存在抛
+        SceneUnavailable；冲突或无解抛 AcceptConflict，会话保持不变。
+        """
         with session.lock:
+            record = load_record()
+            if record is None:
+                raise SceneUnavailable(session.scene_id)
             if record.track_count != session.track_count:
                 raise AcceptConflict(
                     f"轨道数不得变化：会话为 {session.track_count}，"

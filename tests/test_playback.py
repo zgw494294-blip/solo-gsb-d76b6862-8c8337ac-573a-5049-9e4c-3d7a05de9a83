@@ -1,12 +1,15 @@
-"""播放会话测试：创建/推进/接纳、已开始字幕保轨、冲突 409、并发串行化。"""
+"""播放会话测试：创建/推进/接纳、已开始字幕保轨、冲突 409、并发串行化、
+迟到接纳请求不得回写旧快照的回归。"""
 import json
 import threading
+import time
 
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import main as main_module  # noqa: E402
 from app.main import app  # noqa: E402
 
 
@@ -471,3 +474,230 @@ def test_concurrent_advances_serialized():
     assert client.post(
         f"/sessions/{sid}/advance", json={"time_ms": 899}
     ).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 并发回归：迟到的接纳请求不得把会话回写到旧快照
+# ---------------------------------------------------------------------------
+
+
+def stale_scene_payload():
+    """版本 1：s3 未开始（start 1000），end_ms=2000。"""
+    return {
+        "track_count": 2,
+        "expected_revision": 0,
+        "subtitles": [
+            {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000},
+            {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000,
+             "locked_track": 2},
+            {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2000},
+        ],
+    }
+
+
+def make_stale_session(client, scene_id="scene-stale"):
+    """创建场景（revision=1）与会话，并把游标推进到 900（s1、s2 已开始）。"""
+    resp = client.put(f"/scenes/{scene_id}", json=stale_scene_payload())
+    assert resp.status_code == 200
+    sid = client.post("/sessions", json={"scene_id": scene_id}).json()["session_id"]
+    resp = client.post(f"/sessions/{sid}/advance", json={"time_ms": 900})
+    assert resp.status_code == 200
+    return sid
+
+
+def extend_s3_to_4000(client, scene_id):
+    """把场景推进到版本 2：未开始的 s3 的 end_ms 从 2000 改为 4000。"""
+    revise(client, scene_id, 1, [
+        {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000},
+        {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000,
+         "locked_track": 2},
+        {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 4000},
+    ])
+
+
+def patch_first_scene_read(monkeypatch, *, reread_on_release):
+    """故障注入：让第一次场景读取受控暂停，返回 (已暂停事件, 放行事件)。
+
+    reread_on_release=False：暂停前已读出记录，放行后返回该（过时的）
+    记录——模拟“读到旧版本后被挂起”的在途请求；
+    reread_on_release=True：放行后才真正读取——读取生效点即轮到该
+    请求生效的时刻。
+    """
+    store = main_module.get_store()
+    real_get_scene = store.get_scene
+    paused = threading.Event()
+    release = threading.Event()
+    injected = []
+
+    def wrapped_get_scene(scene_id):
+        if injected:
+            return real_get_scene(scene_id)
+        injected.append(scene_id)
+        if reread_on_release:
+            paused.set()
+            assert release.wait(timeout=10), "测试未能及时放行被暂停的读取"
+            return real_get_scene(scene_id)
+        record = real_get_scene(scene_id)
+        paused.set()
+        assert release.wait(timeout=10), "测试未能及时放行被暂停的读取"
+        return record
+
+    monkeypatch.setattr(store, "get_scene", wrapped_get_scene)
+    return paused, release
+
+
+def post_accept_in_thread(sid, responses, key):
+    local = TestClient(app)
+    responses[key] = local.post(f"/sessions/{sid}/accept")
+
+
+def test_accept_stale_inflight_read_cannot_regress_session(monkeypatch):
+    """回归：R1 读到版本 1 后暂停，场景推进到版本 2 且 R2 先接纳版本 2；
+    R1 恢复后不得把 source_revision 与字幕回写到版本 1。"""
+    client = TestClient(app)
+    scene_id = "scene-stale"
+    sid = make_stale_session(client, scene_id)
+
+    # R1 读到版本 1 的记录后被挂起，恢复后仍返回该（已过时的）记录
+    paused, release = patch_first_scene_read(monkeypatch, reread_on_release=False)
+
+    responses = {}
+    t1 = threading.Thread(
+        target=post_accept_in_thread, args=(sid, responses, "r1")
+    )
+    t1.start()
+    assert paused.wait(timeout=10), "R1 未读到场景版本 1"
+
+    # R1 暂停期间：场景把未开始的 s3 的 end_ms 从 2000 改为 4000（版本 2）
+    extend_s3_to_4000(client, scene_id)
+
+    # R2 先接纳版本 2（修复后它会排在 R1 的完整操作之后生效）
+    t2 = threading.Thread(
+        target=post_accept_in_thread, args=(sid, responses, "r2")
+    )
+    t2.start()
+    try:
+        time.sleep(0.2)  # 给 R2 到达会话锁（旧实现下则是完成接纳）的时间
+    finally:
+        release.set()  # R1 恢复
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert not t1.is_alive() and not t2.is_alive()
+
+    assert responses["r1"].status_code == 200
+    assert responses["r2"].status_code == 200
+    assert responses["r2"].json()["source_revision"] == 2
+
+    # 关键断言（用推进探测，避免再次接纳掩盖回写）：会话最终停在版本 2，
+    # 没有被 R1 恢复后回写到版本 1
+    probe = client.post(f"/sessions/{sid}/advance", json={"time_ms": 900}).json()
+    assert probe["source_revision"] == 2
+    probe = client.post(f"/sessions/{sid}/advance", json={"time_ms": 2500}).json()
+    assert probe["source_revision"] == 2
+    assert [(a["id"], a["track"]) for a in probe["active"]] == [
+        ("s2", 2),
+        ("s3", 1),
+    ]
+    s3 = next(a for a in probe["active"] if a["id"] == "s3")
+    assert s3["end_ms"] == 4000  # 字幕未被回写为版本 1 的 2000
+
+
+def test_accept_reads_scene_snapshot_when_its_turn_comes(monkeypatch):
+    """场景读取属于接纳的完整操作：轮到请求生效时才读取场景快照。"""
+    client = TestClient(app)
+    scene_id = "scene-stale"
+    sid = make_stale_session(client, scene_id)
+
+    # R1 在读取生效前被挂起；放行后才真正读取（读到的是当时的快照）
+    paused, release = patch_first_scene_read(monkeypatch, reread_on_release=True)
+
+    responses = {}
+    t1 = threading.Thread(
+        target=post_accept_in_thread, args=(sid, responses, "r1")
+    )
+    t1.start()
+    assert paused.wait(timeout=10)
+
+    # R1 暂停期间场景推进到版本 2（s3 end_ms 2000 -> 4000）
+    extend_s3_to_4000(client, scene_id)
+
+    # R2 到达：与同一会话的接纳串行，必须排在 R1 之后，不能抢先生效
+    t2 = threading.Thread(
+        target=post_accept_in_thread, args=(sid, responses, "r2")
+    )
+    t2.start()
+    try:
+        t2.join(timeout=0.5)
+        assert t2.is_alive(), "R2 在 R1 的完整操作结束前抢先生效"
+    finally:
+        release.set()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert not t1.is_alive() and not t2.is_alive()
+
+    # 迟到的 R1 接纳的是轮到它生效时的快照（版本 2），R2 亦然
+    for key in ("r1", "r2"):
+        assert responses[key].status_code == 200
+        body = responses[key].json()
+        assert body["source_revision"] == 2
+        assert body["cursor_ms"] == 900
+        assert [s["end_ms"] for s in body["subtitles"]] == [1000, 3000, 4000]
+        assert body["assignments"] == [
+            {"id": "s1", "track": 1},  # 已开始：固定原分轨
+            {"id": "s2", "track": 2},  # 已开始：固定原分轨
+            {"id": "s3", "track": 1},
+        ]
+
+
+def test_accept_conflict_after_interleaved_revision_leaves_session(monkeypatch):
+    """交错修订导致的冲突仍返回 409，且失败不改会话也不改场景。"""
+    client = TestClient(app)
+    scene_id = "scene-stale"
+    sid = make_stale_session(client, scene_id)
+
+    # R1 在读取生效前被挂起；放行后读到的是版本 2
+    paused, release = patch_first_scene_read(monkeypatch, reread_on_release=True)
+
+    responses = {}
+    t1 = threading.Thread(
+        target=post_accept_in_thread, args=(sid, responses, "r1")
+    )
+    t1.start()
+    assert paused.wait(timeout=10)
+
+    # R1 暂停期间：版本 2 修改了已开始的 s1（end_ms 1000 -> 900）
+    revise(client, scene_id, 1, [
+        {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 900},
+        {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000,
+         "locked_track": 2},
+        {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2000},
+    ])
+
+    t2 = threading.Thread(
+        target=post_accept_in_thread, args=(sid, responses, "r2")
+    )
+    t2.start()
+    try:
+        t2.join(timeout=0.5)
+        assert t2.is_alive()
+    finally:
+        release.set()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    # 两个请求读到的都是版本 2：已开始字幕被修改，均冲突 409
+    assert responses["r1"].status_code == 409
+    assert responses["r2"].status_code == 409
+
+    # 会话未被失败改动：仍是版本 1 快照、游标 900、原分轨
+    probe = client.post(f"/sessions/{sid}/advance", json={"time_ms": 900}).json()
+    assert probe["source_revision"] == 1
+    assert [(a["id"], a["track"]) for a in probe["active"]] == [
+        ("s1", 1),
+        ("s2", 2),
+    ]
+
+    # 场景本身也不受接纳失败影响：仍是版本 2 的内容
+    scene = client.get(f"/scenes/{scene_id}").json()
+    assert scene["revision"] == 2
+    assert [s["end_ms"] for s in scene["subtitles"]] == [900, 3000, 2000]

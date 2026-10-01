@@ -13,6 +13,7 @@ from .playback import (
     CursorRegression,
     PlaybackManager,
     PlaybackSession,
+    SceneUnavailable,
 )
 from .solver import Subtitle, solve, validate
 from .storage import RevisionConflict, SceneRecord, SceneStore
@@ -26,7 +27,7 @@ app = FastAPI(
         "播放会话（session）按 scene_id 创建内存态会话，游标推进中可接纳场景"
         "后续修订：已开始字幕保持原分轨，其余按原规则重算。"
     ),
-    version="1.2.0",
+    version="1.2.1",
 )
 
 
@@ -401,6 +402,10 @@ def advance_session(session_id: str, req: AdvanceRequest) -> AdvanceResponse:
 def accept_scene_revision(session_id: str) -> SessionStateResponse:
     """接纳场景当前快照，让播放中的会话跟上后续修订。
 
+    场景读取、已开始字幕校验、分轨重算与会话替换在同一会话锁内作为
+    完整操作串行生效：并发接纳时，每个请求接纳的都是轮到它生效时的
+    场景快照，迟到的请求不会把会话回写到旧版本。
+
     - 轨道数不得变；
     - 会话中 start_ms <= 游标的字幕，其 id、speaker、起止时间、
       locked_track 必须不变，并固定原分轨；
@@ -411,13 +416,14 @@ def accept_scene_revision(session_id: str) -> SessionStateResponse:
     （场景本身不变），返回会话最新完整状态。
     """
     session = _get_session_or_404(session_id)
-    record = get_store().get_scene(session.scene_id)
-    if record is None:
+    try:
+        state = get_playback().accept(
+            session, lambda: get_store().get_scene(session.scene_id)
+        )
+    except SceneUnavailable:
         raise HTTPException(
             status_code=404, detail=f"场景 {session.scene_id!r} 不存在"
         )
-    try:
-        state = get_playback().accept(session, record)
     except AcceptConflict as exc:
         raise HTTPException(
             status_code=409,
